@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: roamdesk-relay
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ROAMDESK_ADMIN_TOKEN
+        generateValue: true
+      - key: ROAMDESK_AUTH_URL
+        value: https://dmaizljguaprmcnecnck.supabase.co
+      - key: ROAMDESK_AUTH_PUBLISHABLE_KEY
+        value: sb_publishable_8Dr77rFGpwR6m_ReBOGw6w_HpKYmk5n
