@@ -1,4 +1,4 @@
-"""Versioned ciphertext-only WebSocket transport; bounded, latest-frame delivery."""
+"""Versioned ciphertext-only WebSocket transport with bounded ordered delivery."""
 import collections
 import hashlib
 import select
@@ -17,9 +17,10 @@ except ImportError:
 from accounts import AccountDenied, AccountUnavailable
 
 MAX_FRAME = 3 * 1024 * 1024
-WINDOW = 4
-WINDOW_BYTES = 2 * 1024 * 1024
-SUBPROTOCOL = "roamdesk.frames.v1"
+WINDOW = 3
+WINDOW_BYTES = 3_000_000
+SUBPROTOCOL = "roamdesk.frames.v2"
+LEGACY_SUBPROTOCOL = "roamdesk.frames.v1"
 
 
 def handle(handler):
@@ -54,6 +55,27 @@ def handle(handler):
     finally:
         with server.lock:
             room.streams.pop(handler.connection, None)
+            room.stream_protocols.pop(handler.connection, None)
+            if role == 'view':
+                room.viewer_queues.pop(handler.connection, None)
+                for sequence, waiting in list(room.frame_waiters.items()):
+                    waiting.discard(handler.connection)
+                    if not waiting:
+                        room.frame_waiters.pop(sequence, None)
+                        target = room.frame_host_ack.pop(sequence, None)
+                        if target:
+                            host, host_sequence = target
+                            room.host_acks[host].append(host_sequence)
+                            room.frame_payloads.pop(sequence, None)
+            else:
+                for sequence, (host, _) in list(room.frame_host_ack.items()):
+                    if host is handler.connection:
+                        room.frame_host_ack.pop(sequence, None)
+                        room.frame_waiters.pop(sequence, None)
+                        room.frame_payloads.pop(sequence, None)
+                for queue in room.viewer_queues.values():
+                    queue.clear()
+                room.host_acks.pop(handler.connection, None)
         handler.close_connection = True
     return True
 
@@ -62,16 +84,19 @@ def run(handler, room, role):
     ws = WSConnection(ConnectionType.SERVER)
     ws.initiate_upgrade_connection([(k.encode('ascii'), v.encode('latin-1')) for k, v in handler.headers.items()], handler.path)
     request = next((e for e in ws.events() if isinstance(e, Request)), None)
-    if request is None or SUBPROTOCOL not in request.subprotocols:
+    if request is None or not ({SUBPROTOCOL, LEGACY_SUBPROTOCOL} & set(request.subprotocols)):
         handler.reply(400); return
+    protocol = SUBPROTOCOL if SUBPROTOCOL in request.subprotocols else LEGACY_SUBPROTOCOL
     sock = handler.connection
     sock.settimeout(2)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    with handler.server.lock:
+        room.stream_protocols[sock] = protocol
 
     def send(event):
         sock.sendall(ws.send(event))
 
-    send(AcceptConnection(subprotocol=SUBPROTOCOL))
+    send(AcceptConnection(subprotocol=protocol))
     send(TextMessage(data='ready'))
     partial = bytearray()
     last_sent = 0
@@ -83,6 +108,11 @@ def run(handler, room, role):
     message_start = None
     while True:
         now = time.monotonic()
+        if role == 'upload':
+            with handler.server.lock:
+                acknowledgements = list(room.host_acks.pop(sock, ()))
+            for acknowledged in acknowledgements:
+                send(TextMessage(data='ack:' + str(acknowledged)))
         with handler.server.lock:
             active = (handler.server.rooms.get(room.id) is room and handler.owns(room) and
                       now - room.created < 7 * 86400)
@@ -107,11 +137,17 @@ def run(handler, room, role):
             send(Ping(payload=b'live')); last_ping = now
         if role == 'view' and len(pending) < WINDOW and sum(v[0] for v in pending.values()) < WINDOW_BYTES:
             with handler.server.lock:
-                sequence, frame, stamp = room.frame_sequence, room.frame, room.last_frame
-            if frame and sequence != last_sent and now - stamp < 10:
-                send(BytesMessage(data=struct.pack('!Q', sequence) + frame))
-                pending[sequence] = (len(frame), time.monotonic())
-                last_sent = sequence
+                if protocol == SUBPROTOCOL:
+                    queue = room.viewer_queues[sock]
+                    queued = queue.popleft() if queue else None
+                    frame = room.frame_payloads.get(queued) if queued is not None else None
+                else:
+                    queued = room.frame_sequence if room.frame and room.frame_sequence != last_sent else None
+                    frame = room.frame
+            if queued is not None and frame and now - room.last_frame < 10:
+                send(BytesMessage(data=struct.pack('!Q', queued) + frame))
+                pending[queued] = (len(frame), time.monotonic())
+                last_sent = queued
         ready, _, _ = select.select([sock], [], [], 0.02)
         if not ready:
             continue
@@ -134,6 +170,17 @@ def run(handler, room, role):
                 if sequence not in pending:
                     send(CloseConnection(code=1008, reason='Invalid acknowledgement')); return
                 del pending[sequence]
+                with handler.server.lock:
+                    waiting = room.frame_waiters.get(sequence)
+                    if waiting is not None:
+                        waiting.discard(sock)
+                        if not waiting:
+                            room.frame_waiters.pop(sequence, None)
+                            target = room.frame_host_ack.pop(sequence, None)
+                            if target:
+                                host, host_sequence = target
+                                room.host_acks[host].append(host_sequence)
+                                room.frame_payloads.pop(sequence, None)
             elif isinstance(event, BytesMessage):
                 if role != 'upload':
                     send(CloseConnection(code=1008, reason='Read only stream')); return
@@ -153,7 +200,20 @@ def run(handler, room, role):
                     with handler.server.lock:
                         if handler.server.rooms.get(room.id) is not room:
                             return
+                        outstanding = [(key, value) for key, value in room.frame_host_ack.items() if value[0] is sock]
+                        outstanding_bytes = sum(len(room.frame_payloads.get(key, b'')) for key, _ in outstanding)
+                        if protocol == SUBPROTOCOL and (len(outstanding) >= WINDOW or outstanding_bytes + len(frame) > WINDOW_BYTES):
+                            send(CloseConnection(code=1013, reason='Wait for the viewer frame acknowledgement')); return
                         room.frame = frame; room.frame_etag = tag
                         room.frame_sequence += 1; room.last_frame = time.monotonic()
+                        viewers = {connection for connection, stream_role in room.streams.items()
+                                   if stream_role == 'view' and room.stream_protocols.get(connection) == SUBPROTOCOL}
+                        if viewers and protocol == SUBPROTOCOL:
+                            room.frame_waiters[room.frame_sequence] = viewers
+                            room.frame_host_ack[room.frame_sequence] = (sock, sequence)
+                            room.frame_payloads[room.frame_sequence] = frame
+                            for viewer in viewers:
+                                room.viewer_queues[viewer].append(room.frame_sequence)
+                        else:
+                            room.host_acks[sock].append(sequence)
                     last_host_sequence = sequence
-                    send(TextMessage(data='ack:' + str(sequence)))
