@@ -34,7 +34,13 @@ class Room:
         self.frame = b""
         self.frame_etag = ""
         self.frame_sequence = 0
+        self.frame_waiters = {}
+        self.frame_host_ack = {}
+        self.frame_payloads = {}
+        self.viewer_queues = collections.defaultdict(collections.deque)
+        self.host_acks = collections.defaultdict(collections.deque)
         self.streams = {}
+        self.stream_protocols = {}
         self.commands = collections.OrderedDict()
         self.seen = {}
         self.pairing = None
@@ -68,7 +74,7 @@ class RelayServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "RoamdeskRelay/0.3.0"
+    server_version = "RoamdeskRelay/0.4.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -125,7 +131,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self):
         if self.path == "/health" and self.command == "GET":
-            return self.reply(200, {"status": "ok", "protocol": 1, "version": "0.3.0", "frameSocket": streaming.AVAILABLE})
+            return self.reply(200, {"status": "ok", "protocol": 1, "frameProtocol": 2,
+                                    "version": "0.4.0", "frameSocket": streaming.AVAILABLE})
         self.account_id = None
         if not self.server.allow_anonymous:
             if self.server.authenticator is None:
