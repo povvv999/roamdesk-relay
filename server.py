@@ -3,9 +3,11 @@
 import base64
 import collections
 import hmac
+import hashlib
 import json
 import os
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -29,6 +31,7 @@ class Room:
         self.created = time.monotonic()
         self.last_frame = 0.0
         self.frame = b""
+        self.frame_etag = ""
         self.commands = collections.OrderedDict()
         self.seen = {}
         self.pairing = None
@@ -57,25 +60,41 @@ class RelayServer(ThreadingHTTPServer):
     def get_request(self):
         sock, address = super().get_request()
         sock.settimeout(10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return sock, address
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "RoamdeskRelay/0.1"
+    server_version = "RoamdeskRelay/0.2.1"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
         pass  # Never log credentials, session paths, or payloads.
 
-    def reply(self, status, value=None, binary=False):
+    def reply(self, status, value=None, binary=False, etag=None):
+        # Snapshot the response while locked; socket writes happen after route() exits.
         data = value if binary else json.dumps(value or {}).encode()
-        if status == 204:
+        self.pending_response = (status, data, binary, etag)
+
+    def flush_reply(self):
+        status, value, binary, etag = self.pending_response
+        data = value
+        if status in (204, 304):
             data = b""
         self.send_response(status)
         self.send_header("Content-Type", "application/octet-stream" if binary else "application/json")
         self.send_header("Content-Length", str(len(data)))
+        if etag:
+            self.send_header("ETag", etag)
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Connection", "close")
+        # Only reuse connections whose request bodies were consumed completely.
+        no_body = (not self.headers.get("Transfer-Encoding") and
+                   self.headers.get_all("Content-Length", []) in ([], ["0"]))
+        reusable = (status < 400 and not self.close_connection and
+                    (no_body or self.body_consumed))
+        self.close_connection = not reusable
+        self.send_header("Connection", "keep-alive" if reusable else "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -91,6 +110,7 @@ class Handler(BaseHTTPRequestHandler):
         data = self.rfile.read(length)
         if len(data) != length:
             raise ValueError("Incomplete payload")
+        self.body_consumed = True
         return data if binary else json.loads(data)
 
     def authorized(self, expected):
@@ -102,7 +122,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self):
         if self.path == "/health" and self.command == "GET":
-            return self.reply(200, {"status": "ok", "protocol": 1})
+            return self.reply(200, {"status": "ok", "protocol": 1, "version": "0.2.1"})
         self.account_id = None
         if not self.server.allow_anonymous:
             if self.server.authenticator is None:
@@ -184,11 +204,14 @@ class Handler(BaseHTTPRequestHandler):
                     if len(body) < 28:
                         return self.reply(400)
                     room.frame = body
+                    room.frame_etag = '"' + hashlib.sha256(body).hexdigest() + '"'
                     room.last_frame = now
                     return self.reply(204)
                 if not room.frame or now - room.last_frame > 10:
                     return self.reply(204)
-                return self.reply(200, room.frame, binary=True)
+                if self.headers.get("If-None-Match") == room.frame_etag:
+                    return self.reply(304, etag=room.frame_etag)
+                return self.reply(200, room.frame, binary=True, etag=room.frame_etag)
             if operation == "commands":
                 if self.command == "GET":
                     return self.reply(200, {"commands": [item[1] for item in room.commands.values()]})
@@ -218,12 +241,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(204)
 
     def handle_method(self):
+        self.body_consumed = False
+        self.pending_response = None
         try:
-            self.route()
-        except (ValueError, TypeError, KeyError, UnicodeError, TimeoutError):
-            self.reply(400, {"error": "Invalid request"})
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            try:
+                self.route()
+            except (ValueError, TypeError, KeyError, UnicodeError, TimeoutError):
+                self.reply(400, {"error": "Invalid request"})
+            if self.pending_response is not None:
+                self.flush_reply()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True
 
     do_GET = do_POST = do_PUT = do_DELETE = handle_method
 
