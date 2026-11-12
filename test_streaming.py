@@ -13,14 +13,14 @@ from wsproto.events import Request, AcceptConnection, BytesMessage, TextMessage,
 
 
 class Peer:
-    def __init__(self, address, path, token, account='owner'):
+    def __init__(self, address, path, token, account='owner', protocol='roamdesk.frames.v2'):
         self.socket = socket.create_connection(address, timeout=2)
         self.socket.settimeout(2)
         self.ws = WSConnection(ConnectionType.CLIENT)
         self.events = collections.deque()
         self.partial = bytearray()
         headers = [(b'Authorization', ('Bearer ' + token).encode()), (b'X-Roamdesk-Account-Token', account.encode())]
-        self.send(Request(host='localhost', target=path, extra_headers=headers, subprotocols=['roamdesk.frames.v1']))
+        self.send(Request(host='localhost', target=path, extra_headers=headers, subprotocols=[protocol]))
 
     def send(self, event):
         self.socket.sendall(self.ws.send(event))
@@ -66,31 +66,48 @@ class StreamingTests(unittest.TestCase):
             peer.close()
         self.server.shutdown(); self.server.server_close(); self.thread.join()
 
-    def peer(self, role, token=None, account='owner'):
-        p = Peer(self.server.server_address, self.path + '/stream/' + role, token or self.room['hostToken' if role == 'upload' else 'viewerToken'], account)
+    def peer(self, role, token=None, account='owner', protocol='roamdesk.frames.v2'):
+        p = Peer(self.server.server_address, self.path + '/stream/' + role, token or self.room['hostToken' if role == 'upload' else 'viewerToken'], account, protocol)
         self.peers.append(p); return p
 
     def upload(self, p, seq):
         p.send(BytesMessage(data=struct.pack('!Q', seq) + bytes([seq % 256]) * 40000))
+
+    def host_ack(self, p, seq):
         self.assertEqual(p.read().data, 'ack:' + str(seq))
 
-    def test_push_bounded_window_and_latest_frame(self):
+    def test_push_bounded_window_preserves_video_frame_order(self):
         host, viewer = self.peer('upload').ready(), self.peer('view').ready()
-        for i in range(1, 5):
-            self.upload(host, i)
+        for i in range(1, 4): self.upload(host, i)
+        frames = [viewer.read().data for _ in range(3)]
+        self.assertEqual([struct.unpack('!Q', frame[:8])[0] for frame in frames], [1, 2, 3])
+        self.assertEqual([frame[8:] for frame in frames], [bytes([i]) * 40000 for i in range(1, 4)])
+        host.socket.settimeout(0.1)
+        with self.assertRaises(socket.timeout): host.read()
+        host.socket.settimeout(2)
+        for i in range(1, 4):
+            viewer.send(TextMessage(data='ack:' + str(i)))
+            self.host_ack(host, i)
+
+    def test_legacy_v1_client_remains_compatible(self):
+        host = self.peer('upload', protocol='roamdesk.frames.v1').ready()
+        viewer = self.peer('view', protocol='roamdesk.frames.v1').ready()
+        self.upload(host, 1)
+        self.host_ack(host, 1)
+        frame = viewer.read().data
+        self.assertEqual(struct.unpack('!Q', frame[:8])[0], 1)
+
+    def test_slow_viewer_is_closed_and_releases_host_window(self):
+        host, viewer = self.peer('upload').ready(), self.peer('view').ready()
+        for i in range(1, 4): self.upload(host, i)
+        for i in range(1, 4):
             frame = viewer.read().data
-            self.assertEqual(frame[8:], bytes([i]) * 40000)
-        # Viewer has not acknowledged: later uploads must not pile up behind it.
-        for i in range(5, 10):
-            self.upload(host, i)
-        viewer.socket.settimeout(0.1)
-        with self.assertRaises(socket.timeout):
-            viewer.read()
-        viewer.socket.settimeout(2)
-        viewer.send(TextMessage(data='ack:1'))
-        newest = viewer.read().data
-        self.assertEqual(struct.unpack('!Q', newest[:8])[0], 9)
-        self.assertEqual(newest[8:], bytes([9]) * 40000)
+            self.assertEqual(struct.unpack('!Q', frame[:8])[0], i)
+        viewer.socket.settimeout(3)
+        closed = viewer.read()
+        self.assertIsInstance(closed, CloseConnection)
+        self.assertEqual(closed.code, 1013)
+        for i in range(1, 4): self.host_ack(host, i)
 
     def test_account_and_role_are_enforced_at_upgrade(self):
         for p, expected in [(self.peer('view', account='other'), 404), (self.peer('view', token=self.room['hostToken']), 403), (self.peer('upload', token=self.room['viewerToken']), 403), (self.peer('view', account='invalid'), 401)]:
@@ -102,6 +119,7 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(viewer.read().code, 1008)
         host = self.peer('upload').ready()
         self.upload(host, 1)
+        self.host_ack(host, 1)
         host.send(BytesMessage(data=struct.pack('!Q', 1) + b'x' * 40))
         self.assertEqual(host.read().code, 1008)
 
