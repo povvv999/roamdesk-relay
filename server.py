@@ -14,6 +14,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pairing import handle as handle_pairing
 from accounts import AccountAuthenticator, AccountDenied, AccountUnavailable
+import streaming
 
 MAX_FRAME = 3 * 1024 * 1024
 MAX_JSON = 32 * 1024
@@ -32,6 +33,8 @@ class Room:
         self.last_frame = 0.0
         self.frame = b""
         self.frame_etag = ""
+        self.frame_sequence = 0
+        self.streams = {}
         self.commands = collections.OrderedDict()
         self.seen = {}
         self.pairing = None
@@ -65,7 +68,7 @@ class RelayServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "RoamdeskRelay/0.2.1"
+    server_version = "RoamdeskRelay/0.3.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -122,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self):
         if self.path == "/health" and self.command == "GET":
-            return self.reply(200, {"status": "ok", "protocol": 1, "version": "0.2.1"})
+            return self.reply(200, {"status": "ok", "protocol": 1, "version": "0.3.0", "frameSocket": streaming.AVAILABLE})
         self.account_id = None
         if not self.server.allow_anonymous:
             if self.server.authenticator is None:
@@ -133,6 +136,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(401, {"error": "Sign in required"})
             except AccountUnavailable:
                 return self.reply(503, {"error": "Account service unavailable"})
+        if streaming.handle(self):
+            return
         if handle_pairing(self):
             return
         with self.server.lock:
@@ -198,12 +203,18 @@ class Handler(BaseHTTPRequestHandler):
             room.seen = {key: stamp for key, stamp in room.seen.items() if now - stamp < 120}
             if self.command == "DELETE":
                 del self.server.rooms[room.id]
+                for stream in list(room.streams):
+                    try:
+                        stream.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                 return self.reply(204)
             if operation == "frame":
                 if self.command == "PUT":
                     if len(body) < 28:
                         return self.reply(400)
                     room.frame = body
+                    room.frame_sequence += 1
                     room.frame_etag = '"' + hashlib.sha256(body).hexdigest() + '"'
                     room.last_frame = now
                     return self.reply(204)
