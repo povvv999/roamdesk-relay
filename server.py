@@ -74,7 +74,7 @@ class RelayServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "RoamdeskRelay/0.4.0"
+    server_version = "RoamdeskRelay/0.5.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -131,8 +131,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self):
         if self.path == "/health" and self.command == "GET":
-            return self.reply(200, {"status": "ok", "protocol": 1, "frameProtocol": 2,
-                                    "version": "0.4.0", "frameSocket": streaming.AVAILABLE})
+            return self.reply(200, {"status": "ok", "protocol": 1, "frameProtocol": 4,
+                                    "version": "0.5.0", "frameSocket": streaming.AVAILABLE,
+                                    "frameWindow": streaming.WINDOW})
         self.account_id = None
         if not self.server.allow_anonymous:
             if self.server.authenticator is None:
