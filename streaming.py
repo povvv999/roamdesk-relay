@@ -17,9 +17,13 @@ except ImportError:
 from accounts import AccountDenied, AccountUnavailable
 
 MAX_FRAME = 3 * 1024 * 1024
-WINDOW = 3
+# Hard cap on unacknowledged frames per connection. Throughput is window / round trip,
+# so a 3-frame cap held a 600 ms acknowledgement loop to about 5 frames/s. The host
+# picks a smaller window from its measured round trip; this only bounds relay memory.
+WINDOW = 24
 WINDOW_BYTES = 3_000_000
-SUBPROTOCOL = "roamdesk.frames.v2"
+SUBPROTOCOL = "roamdesk.frames.v4"
+ORDERED_PROTOCOLS = {SUBPROTOCOL, "roamdesk.frames.v3", "roamdesk.frames.v2"}
 LEGACY_SUBPROTOCOL = "roamdesk.frames.v1"
 
 
@@ -84,9 +88,10 @@ def run(handler, room, role):
     ws = WSConnection(ConnectionType.SERVER)
     ws.initiate_upgrade_connection([(k.encode('ascii'), v.encode('latin-1')) for k, v in handler.headers.items()], handler.path)
     request = next((e for e in ws.events() if isinstance(e, Request)), None)
-    if request is None or not ({SUBPROTOCOL, LEGACY_SUBPROTOCOL} & set(request.subprotocols)):
+    if request is None or not (ORDERED_PROTOCOLS | {LEGACY_SUBPROTOCOL}) & set(request.subprotocols):
         handler.reply(400); return
-    protocol = SUBPROTOCOL if SUBPROTOCOL in request.subprotocols else LEGACY_SUBPROTOCOL
+    protocol = next((candidate for candidate in (SUBPROTOCOL, "roamdesk.frames.v3", "roamdesk.frames.v2", LEGACY_SUBPROTOCOL)
+                     if candidate in request.subprotocols), LEGACY_SUBPROTOCOL)
     sock = handler.connection
     sock.settimeout(2)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -137,7 +142,7 @@ def run(handler, room, role):
             send(Ping(payload=b'live')); last_ping = now
         if role == 'view' and len(pending) < WINDOW and sum(v[0] for v in pending.values()) < WINDOW_BYTES:
             with handler.server.lock:
-                if protocol == SUBPROTOCOL:
+                if protocol in ORDERED_PROTOCOLS:
                     queue = room.viewer_queues[sock]
                     queued = queue.popleft() if queue else None
                     frame = room.frame_payloads.get(queued) if queued is not None else None
@@ -202,13 +207,13 @@ def run(handler, room, role):
                             return
                         outstanding = [(key, value) for key, value in room.frame_host_ack.items() if value[0] is sock]
                         outstanding_bytes = sum(len(room.frame_payloads.get(key, b'')) for key, _ in outstanding)
-                        if protocol == SUBPROTOCOL and (len(outstanding) >= WINDOW or outstanding_bytes + len(frame) > WINDOW_BYTES):
+                        if protocol in ORDERED_PROTOCOLS and (len(outstanding) >= WINDOW or outstanding_bytes + len(frame) > WINDOW_BYTES):
                             send(CloseConnection(code=1013, reason='Wait for the viewer frame acknowledgement')); return
                         room.frame = frame; room.frame_etag = tag
                         room.frame_sequence += 1; room.last_frame = time.monotonic()
                         viewers = {connection for connection, stream_role in room.streams.items()
-                                   if stream_role == 'view' and room.stream_protocols.get(connection) == SUBPROTOCOL}
-                        if viewers and protocol == SUBPROTOCOL:
+                                   if stream_role == 'view' and room.stream_protocols.get(connection) == protocol}
+                        if viewers and protocol in ORDERED_PROTOCOLS:
                             room.frame_waiters[room.frame_sequence] = viewers
                             room.frame_host_ack[room.frame_sequence] = (sock, sequence)
                             room.frame_payloads[room.frame_sequence] = frame
